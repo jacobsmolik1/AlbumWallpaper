@@ -4,9 +4,9 @@ import android.app.Notification
 import android.app.WallpaperManager
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Rect
+import android.graphics.Point
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.media.MediaMetadata
@@ -18,6 +18,8 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import android.view.WindowManager
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import java.net.HttpURLConnection
+import java.net.URL
 
 class AlbumArtService : NotificationListenerService() {
 
@@ -37,18 +39,19 @@ class AlbumArtService : NotificationListenerService() {
         if (notification.flags and Notification.FLAG_ONGOING_EVENT == 0) return
 
         val extras = notification.extras
-        var bitmap: Bitmap? = null
+        var fallbackBitmap: Bitmap? = null
+        var artUri: String? = null
         var title: String? = null
         var artist: String? = null
 
-        // MediaSession gives us the highest-quality bitmap
         val token = extras.getParcelable<MediaSession.Token>(Notification.EXTRA_MEDIA_SESSION)
         if (token != null) {
             try {
                 val controller = MediaController(this, token)
                 val meta = controller.metadata
-                bitmap = meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                fallbackBitmap = meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
                     ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                artUri = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
                 title = meta?.getString(MediaMetadata.METADATA_KEY_TITLE)
                 artist = meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)
                     ?: meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
@@ -57,22 +60,72 @@ class AlbumArtService : NotificationListenerService() {
             }
         }
 
-        // Fall back to the notification's large icon
-        if (bitmap == null) {
-            bitmap = notification.getLargeIcon()?.loadDrawable(this)?.toBitmap()
+        if (fallbackBitmap == null) {
+            fallbackBitmap = notification.getLargeIcon()?.loadDrawable(this)?.toBitmap()
         }
 
         val newTitle = title ?: extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
-        if (bitmap == null || newTitle == lastTitle) return
+        if (newTitle == lastTitle) return
         lastTitle = newTitle
 
-        applyLockscreenWallpaper(bitmap)
+        val capturedUri = artUri
+        val capturedFallback = fallbackBitmap
+        val capturedTitle = title ?: newTitle
+        val capturedArtist = artist ?: extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
 
-        LocalBroadcastManager.getInstance(this).sendBroadcast(
-            Intent(ACTION_TRACK_CHANGED)
-                .putExtra(EXTRA_TITLE, title ?: newTitle)
-                .putExtra(EXTRA_ARTIST, artist ?: extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
-        )
+        Thread {
+            val bitmap = fetchHighRes(capturedUri, capturedTitle, capturedArtist)
+                ?: capturedFallback
+                ?: return@Thread
+            applyLockscreenWallpaper(bitmap)
+            LocalBroadcastManager.getInstance(this).sendBroadcast(
+                Intent(ACTION_TRACK_CHANGED)
+                    .putExtra(EXTRA_TITLE, capturedTitle)
+                    .putExtra(EXTRA_ARTIST, capturedArtist)
+            )
+        }.start()
+    }
+
+    // 1) Bump Google CDN size param  2) iTunes fallback
+    private fun fetchHighRes(uri: String?, title: String?, artist: String?): Bitmap? {
+        // Google image CDN — replace size suffix with 1080x1080
+        if (!uri.isNullOrEmpty() && uri.contains("lh3.googleusercontent.com")) {
+            val highResUrl = uri
+                .replace(Regex("=w\\d+-h\\d+[^\"\\s]*$"), "=w1080-h1080-l90-rj")
+                .replace(Regex("=s\\d+[^\"\\s]*$"), "=s1080")
+            downloadBitmap(highResUrl)?.let { return it }
+        }
+
+        // iTunes Search API — free, no key, returns up to ~3000x3000
+        if (!title.isNullOrEmpty()) {
+            try {
+                val query = java.net.URLEncoder.encode(
+                    listOfNotNull(artist, title).joinToString(" "), "UTF-8"
+                )
+                val searchUrl = "https://itunes.apple.com/search?term=$query&entity=song&limit=1"
+                val json = URL(searchUrl).readText()
+                val artUrl100 = Regex("\"artworkUrl100\":\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+                if (!artUrl100.isNullOrEmpty()) {
+                    val artUrl = artUrl100.replace("100x100bb", "1080x1080bb")
+                    downloadBitmap(artUrl)?.let { return it }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "iTunes fetch failed", e)
+            }
+        }
+
+        return null
+    }
+
+    private fun downloadBitmap(url: String): Bitmap? = try {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 8000
+        conn.readTimeout = 10000
+        conn.connect()
+        if (conn.responseCode == 200) BitmapFactory.decodeStream(conn.inputStream) else null
+    } catch (e: Exception) {
+        Log.w(TAG, "downloadBitmap failed for $url", e)
+        null
     }
 
     private fun applyLockscreenWallpaper(bitmap: Bitmap) {
@@ -95,12 +148,10 @@ class AlbumArtService : NotificationListenerService() {
             screenH = bounds.height()
         } else {
             @Suppress("DEPRECATION")
-            val size = android.graphics.Point().also { wm.defaultDisplay.getRealSize(it) }
+            val size = Point().also { wm.defaultDisplay.getRealSize(it) }
             screenW = size.x
             screenH = size.y
         }
-
-        // Scale art to fill screen (center-crop), keeping aspect ratio
         val scale = maxOf(screenW.toFloat() / src.width, screenH.toFloat() / src.height)
         val scaledW = (src.width * scale).toInt()
         val scaledH = (src.height * scale).toInt()
