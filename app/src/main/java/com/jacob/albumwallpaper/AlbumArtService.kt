@@ -7,6 +7,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.Point
 import android.graphics.drawable.BitmapDrawable
@@ -134,12 +136,23 @@ class AlbumArtService : NotificationListenerService() {
 
     private fun applyBlur(src: Bitmap, radius: Float): Bitmap {
         if (radius < 1f) return src
-        // Iterative downsample → bilinear upsample produces smooth blur
-        val divisor = (4 + radius * 1.1f).toInt().coerceIn(4, 32)
-        val w = maxOf(8, src.width / divisor)
-        val h = maxOf(8, src.height / divisor)
-        val small = Bitmap.createScaledBitmap(src, w, h, true)
-        return Bitmap.createScaledBitmap(small, src.width, src.height, true)
+
+        // Downsample 4x → StackBlur (true Gaussian-like) → upsample
+        val scale = 4
+        val small   = Bitmap.createScaledBitmap(src, src.width / scale, src.height / scale, true)
+        val blurred = StackBlur.blur(small, (radius * 1.6f).toInt().coerceIn(2, 50))
+        val full    = Bitmap.createScaledBitmap(blurred, src.width, src.height, true)
+
+        // Liquid-glass finish: vibrancy (saturation boost) + frosted white veil
+        val result = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(result)
+        canvas.drawBitmap(full, 0f, 0f, Paint().apply {
+            colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(1.4f) })
+        })
+        // Subtle white frost layer (~9% opacity)
+        canvas.drawRect(0f, 0f, result.width.toFloat(), result.height.toFloat(),
+            Paint().apply { color = 0x17FFFFFF.toInt() })
+        return result
     }
 
     private fun applyDim(src: Bitmap, amount: Float): Bitmap {
