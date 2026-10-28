@@ -6,6 +6,8 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Point
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -26,12 +28,35 @@ class AlbumArtService : NotificationListenerService() {
     companion object {
         private const val TAG = "AlbumArtService"
         private const val YTM_PACKAGE = "com.google.android.apps.youtube.music"
-        const val ACTION_TRACK_CHANGED = "com.jacob.albumwallpaper.TRACK_CHANGED"
-        const val EXTRA_TITLE = "title"
-        const val EXTRA_ARTIST = "artist"
+        const val ACTION_TRACK_CHANGED  = "com.jacob.albumwallpaper.TRACK_CHANGED"
+        const val ACTION_REAPPLY        = "com.jacob.albumwallpaper.REAPPLY"
+        const val EXTRA_TITLE           = "title"
+        const val EXTRA_ARTIST          = "artist"
+
+        // Cached so settings changes can reapply without waiting for next track
+        @Volatile var lastCleanBitmap: Bitmap? = null
     }
 
     private var lastTitle: String? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        LocalBroadcastManager.getInstance(this)
+            .registerReceiver(reapplyReceiver,
+                android.content.IntentFilter(ACTION_REAPPLY))
+    }
+
+    override fun onDestroy() {
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(reapplyReceiver)
+        super.onDestroy()
+    }
+
+    private val reapplyReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: android.content.Context, intent: Intent) {
+            val bmp = lastCleanBitmap ?: return
+            Thread { applyWallpapers(bmp) }.start()
+        }
+    }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         if (sbn.packageName != YTM_PACKAGE) return
@@ -39,7 +64,7 @@ class AlbumArtService : NotificationListenerService() {
         if (notification.flags and Notification.FLAG_ONGOING_EVENT == 0) return
 
         val extras = notification.extras
-        var fallbackBitmap: Bitmap? = null
+        var fallback: Bitmap? = null
         var artUri: String? = null
         var title: String? = null
         var artist: String? = null
@@ -49,126 +74,136 @@ class AlbumArtService : NotificationListenerService() {
             try {
                 val controller = MediaController(this, token)
                 val meta = controller.metadata
-                fallbackBitmap = meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                fallback = meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
                     ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ART)
-                artUri = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
-                title = meta?.getString(MediaMetadata.METADATA_KEY_TITLE)
-                artist = meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+                artUri  = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                title   = meta?.getString(MediaMetadata.METADATA_KEY_TITLE)
+                artist  = meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)
                     ?: meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
-            } catch (e: Exception) {
-                Log.w(TAG, "MediaSession read failed", e)
-            }
+            } catch (e: Exception) { Log.w(TAG, "MediaSession read failed", e) }
         }
 
-        if (fallbackBitmap == null) {
-            fallbackBitmap = notification.getLargeIcon()?.loadDrawable(this)?.toBitmap()
-        }
+        if (fallback == null)
+            fallback = notification.getLargeIcon()?.loadDrawable(this)?.toBitmap()
 
         val newTitle = title ?: extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
         if (newTitle == lastTitle) return
         lastTitle = newTitle
 
-        val capturedUri = artUri
-        val capturedFallback = fallbackBitmap
-        val capturedTitle = title ?: newTitle
-        val capturedArtist = artist ?: extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+        val capUri     = artUri
+        val capFallback = fallback
+        val capTitle   = title ?: newTitle
+        val capArtist  = artist ?: extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
 
         Thread {
-            val bitmap = fetchHighRes(capturedUri, capturedTitle, capturedArtist)
-                ?: capturedFallback
-                ?: return@Thread
-            applyLockscreenWallpaper(bitmap)
+            val bitmap = fetchHighRes(capUri, capTitle, capArtist) ?: capFallback ?: return@Thread
+            lastCleanBitmap = bitmap
+            applyWallpapers(bitmap)
             LocalBroadcastManager.getInstance(this).sendBroadcast(
                 Intent(ACTION_TRACK_CHANGED)
-                    .putExtra(EXTRA_TITLE, capturedTitle)
-                    .putExtra(EXTRA_ARTIST, capturedArtist)
+                    .putExtra(EXTRA_TITLE, capTitle)
+                    .putExtra(EXTRA_ARTIST, capArtist)
             )
         }.start()
     }
 
-    // 1) Bump Google CDN size param  2) iTunes fallback
+    // ── Wallpaper application ──────────────────────────────────────────────────
+
+    private fun applyWallpapers(clean: Bitmap) {
+        val p   = Settings.prefs(this)
+        val wm  = WallpaperManager.getInstance(this)
+        val screen = fitToScreen(clean)
+
+        // Lockscreen always gets the clean art
+        try { wm.setBitmap(screen, null, true, WallpaperManager.FLAG_LOCK) }
+        catch (e: Exception) { Log.e(TAG, "Lock wallpaper failed", e) }
+
+        // Home screen: optional, with blur + dim
+        if (p.getBoolean(Settings.APPLY_HOME, false)) {
+            var home = screen.copy(Bitmap.Config.ARGB_8888, true)
+            if (p.getBoolean(Settings.BLUR_ON, false))
+                home = applyBlur(home, p.getFloat(Settings.BLUR_RADIUS, 10f))
+            if (p.getBoolean(Settings.DIM_ON, false))
+                home = applyDim(home, p.getFloat(Settings.DIM_AMOUNT, 40f) / 100f)
+            try { wm.setBitmap(home, null, true, WallpaperManager.FLAG_SYSTEM) }
+            catch (e: Exception) { Log.e(TAG, "Home wallpaper failed", e) }
+        }
+    }
+
+    // ── Effects ────────────────────────────────────────────────────────────────
+
+    private fun applyBlur(src: Bitmap, radius: Float): Bitmap {
+        if (radius < 1f) return src
+        // Iterative downsample → bilinear upsample produces smooth blur
+        val divisor = (4 + radius * 1.1f).toInt().coerceIn(4, 32)
+        val w = maxOf(8, src.width / divisor)
+        val h = maxOf(8, src.height / divisor)
+        val small = Bitmap.createScaledBitmap(src, w, h, true)
+        return Bitmap.createScaledBitmap(small, src.width, src.height, true)
+    }
+
+    private fun applyDim(src: Bitmap, amount: Float): Bitmap {
+        val result = src.copy(Bitmap.Config.ARGB_8888, true)
+        Canvas(result).drawRect(
+            0f, 0f, result.width.toFloat(), result.height.toFloat(),
+            Paint().apply {
+                color = Color.BLACK
+                alpha = (amount.coerceIn(0f, 1f) * 255).toInt()
+            }
+        )
+        return result
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private fun fitToScreen(src: Bitmap): Bitmap {
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val screenW: Int; val screenH: Int
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = wm.currentWindowMetrics.bounds; screenW = b.width(); screenH = b.height()
+        } else {
+            @Suppress("DEPRECATION")
+            val sz = Point().also { wm.defaultDisplay.getRealSize(it) }
+            screenW = sz.x; screenH = sz.y
+        }
+        val scale  = maxOf(screenW.toFloat() / src.width, screenH.toFloat() / src.height)
+        val sw     = (src.width * scale).toInt()
+        val sh     = (src.height * scale).toInt()
+        val scaled = Bitmap.createScaledBitmap(src, sw, sh, true)
+        return Bitmap.createBitmap(scaled, (sw - screenW) / 2, (sh - screenH) / 2, screenW, screenH)
+    }
+
     private fun fetchHighRes(uri: String?, title: String?, artist: String?): Bitmap? {
-        // Google image CDN — replace size suffix with 1080x1080
         if (!uri.isNullOrEmpty() && uri.contains("lh3.googleusercontent.com")) {
-            val highResUrl = uri
+            val url = uri
                 .replace(Regex("=w\\d+-h\\d+[^\"\\s]*$"), "=w1080-h1080-l90-rj")
                 .replace(Regex("=s\\d+[^\"\\s]*$"), "=s1080")
-            downloadBitmap(highResUrl)?.let { return it }
+            downloadBitmap(url)?.let { return it }
         }
-
-        // iTunes Search API — free, no key, returns up to ~3000x3000
         if (!title.isNullOrEmpty()) {
             try {
-                val query = java.net.URLEncoder.encode(
-                    listOfNotNull(artist, title).joinToString(" "), "UTF-8"
-                )
-                val searchUrl = "https://itunes.apple.com/search?term=$query&entity=song&limit=1"
-                val json = URL(searchUrl).readText()
-                val artUrl100 = Regex("\"artworkUrl100\":\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-                if (!artUrl100.isNullOrEmpty()) {
-                    val artUrl = artUrl100.replace("100x100bb", "1080x1080bb")
-                    downloadBitmap(artUrl)?.let { return it }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "iTunes fetch failed", e)
-            }
+                val q = java.net.URLEncoder.encode(listOfNotNull(artist, title).joinToString(" "), "UTF-8")
+                val json = URL("https://itunes.apple.com/search?term=$q&entity=song&limit=1").readText()
+                val url100 = Regex("\"artworkUrl100\":\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+                if (!url100.isNullOrEmpty())
+                    downloadBitmap(url100.replace("100x100bb", "1080x1080bb"))?.let { return it }
+            } catch (e: Exception) { Log.w(TAG, "iTunes fetch failed", e) }
         }
-
         return null
     }
 
     private fun downloadBitmap(url: String): Bitmap? = try {
         val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 8000
-        conn.readTimeout = 10000
-        conn.connect()
+        conn.connectTimeout = 8000; conn.readTimeout = 10000; conn.connect()
         if (conn.responseCode == 200) BitmapFactory.decodeStream(conn.inputStream) else null
-    } catch (e: Exception) {
-        Log.w(TAG, "downloadBitmap failed for $url", e)
-        null
-    }
-
-    private fun applyLockscreenWallpaper(bitmap: Bitmap) {
-        try {
-            WallpaperManager.getInstance(this)
-                .setBitmap(fitToScreen(bitmap), null, true, WallpaperManager.FLAG_LOCK)
-            Log.d(TAG, "Lockscreen wallpaper updated")
-        } catch (e: Exception) {
-            Log.e(TAG, "setBitmap failed", e)
-        }
-    }
-
-    private fun fitToScreen(src: Bitmap): Bitmap {
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val screenW: Int
-        val screenH: Int
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = wm.currentWindowMetrics.bounds
-            screenW = bounds.width()
-            screenH = bounds.height()
-        } else {
-            @Suppress("DEPRECATION")
-            val size = Point().also { wm.defaultDisplay.getRealSize(it) }
-            screenW = size.x
-            screenH = size.y
-        }
-        val scale = maxOf(screenW.toFloat() / src.width, screenH.toFloat() / src.height)
-        val scaledW = (src.width * scale).toInt()
-        val scaledH = (src.height * scale).toInt()
-        val scaled = Bitmap.createScaledBitmap(src, scaledW, scaledH, true)
-        val x = (scaledW - screenW) / 2
-        val y = (scaledH - screenH) / 2
-        return Bitmap.createBitmap(scaled, x, y, screenW, screenH)
-    }
+    } catch (e: Exception) { Log.w(TAG, "downloadBitmap failed: $url", e); null }
 
     private fun Drawable.toBitmap(): Bitmap {
         if (this is BitmapDrawable && bitmap != null) return bitmap
         val w = if (intrinsicWidth > 0) intrinsicWidth else 512
         val h = if (intrinsicHeight > 0) intrinsicHeight else 512
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        setBounds(0, 0, w, h)
-        draw(canvas)
+        val c = Canvas(bmp); setBounds(0, 0, w, h); draw(c)
         return bmp
     }
 }
