@@ -5,14 +5,18 @@ import android.app.WallpaperManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSession
+import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import android.view.WindowManager
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 class AlbumArtService : NotificationListenerService() {
@@ -74,11 +78,36 @@ class AlbumArtService : NotificationListenerService() {
     private fun applyLockscreenWallpaper(bitmap: Bitmap) {
         try {
             WallpaperManager.getInstance(this)
-                .setBitmap(bitmap, null, true, WallpaperManager.FLAG_LOCK)
+                .setBitmap(fitToScreen(bitmap), null, true, WallpaperManager.FLAG_LOCK)
             Log.d(TAG, "Lockscreen wallpaper updated")
         } catch (e: Exception) {
             Log.e(TAG, "setBitmap failed", e)
         }
+    }
+
+    private fun fitToScreen(src: Bitmap): Bitmap {
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val screenW: Int
+        val screenH: Int
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            screenW = bounds.width()
+            screenH = bounds.height()
+        } else {
+            @Suppress("DEPRECATION")
+            val size = android.graphics.Point().also { wm.defaultDisplay.getRealSize(it) }
+            screenW = size.x
+            screenH = size.y
+        }
+
+        // Scale art to fill screen (center-crop), keeping aspect ratio
+        val scale = maxOf(screenW.toFloat() / src.width, screenH.toFloat() / src.height)
+        val scaledW = (src.width * scale).toInt()
+        val scaledH = (src.height * scale).toInt()
+        val scaled = Bitmap.createScaledBitmap(src, scaledW, scaledH, true)
+        val x = (scaledW - screenW) / 2
+        val y = (scaledH - screenH) / 2
+        return Bitmap.createBitmap(scaled, x, y, screenW, screenH)
     }
 
     private fun Drawable.toBitmap(): Bitmap {
