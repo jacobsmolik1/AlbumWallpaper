@@ -40,6 +40,7 @@ class AlbumArtService : NotificationListenerService() {
         @Volatile var lastCleanBitmap: Bitmap? = null
     }
 
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private var lastTitle: String? = null
 
     private val reapplyReceiver = object : BroadcastReceiver() {
@@ -56,6 +57,7 @@ class AlbumArtService : NotificationListenerService() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         LocalBroadcastManager.getInstance(this).unregisterReceiver(reapplyReceiver)
         super.onDestroy()
     }
@@ -99,23 +101,26 @@ class AlbumArtService : NotificationListenerService() {
         val capTitle  = title ?: newTitle
         val capArtist = artist ?: extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
 
-        Thread {
-            val bitmap = fetchHighRes(capUri, capTitle, capArtist) ?: capFb ?: return@Thread
-            maybeSaveOriginal()
-            lastCleanBitmap = bitmap
-            saveThumbnail(bitmap)
-            applyWallpapers(bitmap)
-            if (prefs.getBoolean(Settings.KUSTOM_ON, false)) saveKustom(bitmap)
+        handler.removeCallbacksAndMessages(null)
+        handler.postDelayed({
+            Thread {
+                val bitmap = fetchHighRes(capUri, capTitle, capArtist) ?: capFb ?: return@Thread
+                maybeSaveOriginal()
+                lastCleanBitmap = bitmap
+                saveThumbnail(bitmap)
+                applyWallpapers(bitmap)
+                if (prefs.getBoolean(Settings.KUSTOM_ON, false)) saveKustom(bitmap)
 
-            val palette    = Palette.from(bitmap).generate()
-            val seedColor  = palette.getVibrantColor(palette.getDominantColor(0xFF1DB954.toInt()))
-            LocalBroadcastManager.getInstance(this).sendBroadcast(
-                Intent(ACTION_TRACK_CHANGED)
-                    .putExtra(EXTRA_TITLE, capTitle)
-                    .putExtra(EXTRA_ARTIST, capArtist)
-                    .putExtra(EXTRA_SEED_COLOR, seedColor)
-            )
-        }.start()
+                val palette   = Palette.from(bitmap).generate()
+                val seedColor = palette.getVibrantColor(palette.getDominantColor(0xFF1DB954.toInt()))
+                LocalBroadcastManager.getInstance(this).sendBroadcast(
+                    Intent(ACTION_TRACK_CHANGED)
+                        .putExtra(EXTRA_TITLE, capTitle)
+                        .putExtra(EXTRA_ARTIST, capArtist)
+                        .putExtra(EXTRA_SEED_COLOR, seedColor)
+                )
+            }.start()
+        }, 400)
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
@@ -216,19 +221,7 @@ class AlbumArtService : NotificationListenerService() {
 
     private fun crossfadeSet(from: Bitmap?, to: Bitmap, flag: Int, durationMs: Long,
                               prefs: android.content.SharedPreferences) {
-        val wm = WallpaperManager.getInstance(this)
-        if (from == null || !prefs.getBoolean(Settings.CROSSFADE_ON, false) || durationMs < 100) {
-            runCatching { wm.setBitmap(to, null, true, flag) }
-            return
-        }
-        val steps = 8
-        val delay = durationMs / steps
-        for (i in 1..steps) {
-            val alpha = i.toFloat() / steps
-            val frame = blendBitmaps(from, to, alpha)
-            runCatching { wm.setBitmap(frame, null, true, flag) }
-            Thread.sleep(delay)
-        }
+        runCatching { WallpaperManager.getInstance(this).setBitmap(to, null, true, flag) }
     }
 
     private fun blendBitmaps(a: Bitmap, b: Bitmap, alpha: Float): Bitmap {
