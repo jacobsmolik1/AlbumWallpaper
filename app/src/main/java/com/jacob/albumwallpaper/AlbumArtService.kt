@@ -186,7 +186,9 @@ class AlbumArtService : NotificationListenerService() {
         val scale   = 4
         val small   = Bitmap.createScaledBitmap(src, src.width / scale, src.height / scale, true)
         val blurred = StackBlur.blur(small, (radius * 1.6f).toInt().coerceIn(2, 50))
+        if (small !== blurred) small.recycle()
         val full    = Bitmap.createScaledBitmap(blurred, src.width, src.height, true)
+        if (blurred !== full) blurred.recycle()
         val result  = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
         val canvas  = Canvas(result)
         canvas.drawBitmap(full, 0f, 0f, Paint().apply {
@@ -194,6 +196,7 @@ class AlbumArtService : NotificationListenerService() {
         })
         canvas.drawRect(0f, 0f, result.width.toFloat(), result.height.toFloat(),
             Paint().apply { color = 0x17FFFFFF.toInt() })
+        if (full !== result) full.recycle()
         return result
     }
 
@@ -231,7 +234,9 @@ class AlbumArtService : NotificationListenerService() {
     private fun blendBitmaps(a: Bitmap, b: Bitmap, alpha: Float): Bitmap {
         val result = Bitmap.createBitmap(b.width, b.height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
-        canvas.drawBitmap(Bitmap.createScaledBitmap(a, b.width, b.height, true), 0f, 0f, null)
+        val scaled = Bitmap.createScaledBitmap(a, b.width, b.height, true)
+        canvas.drawBitmap(scaled, 0f, 0f, null)
+        if (scaled !== a) scaled.recycle()
         canvas.drawBitmap(b, 0f, 0f, Paint().apply { this.alpha = (alpha * 255).toInt() })
         return result
     }
@@ -276,6 +281,7 @@ class AlbumArtService : NotificationListenerService() {
             FileOutputStream(File(filesDir, "thumb.jpg")).use {
                 small.compress(Bitmap.CompressFormat.JPEG, 85, it)
             }
+            if (small !== bitmap) small.recycle()
         } catch (e: Exception) { Log.w(TAG, "saveThumbnail failed", e) }
     }
 
@@ -305,7 +311,9 @@ class AlbumArtService : NotificationListenerService() {
         val sw     = (src.width  * scale).toInt()
         val sh     = (src.height * scale).toInt()
         val scaled = Bitmap.createScaledBitmap(src, sw, sh, true)
-        return Bitmap.createBitmap(scaled, (sw - screenW) / 2, (sh - screenH) / 2, screenW, screenH)
+        val result = Bitmap.createBitmap(scaled, (sw - screenW) / 2, (sh - screenH) / 2, screenW, screenH)
+        if (scaled !== result && scaled !== src) scaled.recycle()
+        return result
     }
 
     // ── High-res fetch ────────────────────────────────────────────────────────
@@ -320,7 +328,10 @@ class AlbumArtService : NotificationListenerService() {
         if (!title.isNullOrEmpty()) {
             try {
                 val q    = java.net.URLEncoder.encode(listOfNotNull(artist, title).joinToString(" "), "UTF-8")
-                val json = URL("https://itunes.apple.com/search?term=$q&entity=song&limit=1").readText()
+                val conn = URL("https://itunes.apple.com/search?term=$q&entity=song&limit=1")
+                    .openConnection() as HttpURLConnection
+                conn.connectTimeout = 8000; conn.readTimeout = 10000
+                val json = conn.inputStream.bufferedReader().use { it.readText() }
                 val url  = Regex("\"artworkUrl100\":\"([^\"]+)\"").find(json)?.groupValues?.get(1)
                     ?.replace("100x100bb", "1080x1080bb")
                 if (!url.isNullOrEmpty()) downloadBitmap(url)?.let { return it }
