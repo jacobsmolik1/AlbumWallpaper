@@ -104,7 +104,7 @@ class AlbumArtService : NotificationListenerService() {
         handler.removeCallbacksAndMessages(null)
         handler.postDelayed({
             Thread {
-                val bitmap = fetchHighRes(capUri, capTitle, capArtist) ?: capFb ?: return@Thread
+                val bitmap = fetchHighRes(capUri) ?: capFb ?: fetchITunes(capTitle, capArtist) ?: return@Thread
                 maybeSaveOriginal()
                 lastCleanBitmap = bitmap
                 saveThumbnail(bitmap)
@@ -311,26 +311,34 @@ class AlbumArtService : NotificationListenerService() {
 
     // ── High-res fetch ────────────────────────────────────────────────────────
 
-    private fun fetchHighRes(uri: String?, title: String?, artist: String?): Bitmap? {
-        if (!uri.isNullOrEmpty() && uri.contains("lh3.googleusercontent.com")) {
+    // Returns high-res art from CDN if possible; returns null so caller can use the always-correct
+    // MediaSession fallback bitmap before reaching fetchITunes().
+    private fun fetchHighRes(uri: String?): Bitmap? {
+        if (uri.isNullOrEmpty()) return null
+        if (uri.contains("lh3.googleusercontent.com")) {
             val url = uri
                 .replace(Regex("=w\\d+-h\\d+[^\"\\s]*$"), "=w1080-h1080-l90-rj")
                 .replace(Regex("=s\\d+[^\"\\s]*$"), "=s1080")
             downloadBitmap(url)?.let { return it }
         }
-        if (!title.isNullOrEmpty()) {
-            try {
-                val q    = java.net.URLEncoder.encode(listOfNotNull(artist, title).joinToString(" "), "UTF-8")
-                val conn = URL("https://itunes.apple.com/search?term=$q&entity=song&limit=1")
-                    .openConnection() as HttpURLConnection
-                conn.connectTimeout = 8000; conn.readTimeout = 10000
-                val json = conn.inputStream.bufferedReader().use { it.readText() }
-                val url  = Regex("\"artworkUrl100\":\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-                    ?.replace("100x100bb", "1080x1080bb")
-                if (!url.isNullOrEmpty()) downloadBitmap(url)?.let { return it }
-            } catch (e: Exception) { Log.w(TAG, "iTunes fetch failed", e) }
+        if (uri.contains("i.scdn.co")) {
+            downloadBitmap(uri)?.let { return it }
         }
         return null
+    }
+
+    private fun fetchITunes(title: String?, artist: String?): Bitmap? {
+        if (title.isNullOrEmpty()) return null
+        return try {
+            val q    = java.net.URLEncoder.encode(listOfNotNull(artist, title).joinToString(" "), "UTF-8")
+            val conn = URL("https://itunes.apple.com/search?term=$q&entity=song&limit=1")
+                .openConnection() as HttpURLConnection
+            conn.connectTimeout = 8000; conn.readTimeout = 10000
+            val json = conn.inputStream.bufferedReader().use { it.readText() }
+            val url  = Regex("\"artworkUrl100\":\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+                ?.replace("100x100bb", "1080x1080bb")
+            if (!url.isNullOrEmpty()) downloadBitmap(url) else null
+        } catch (e: Exception) { Log.w(TAG, "iTunes fetch failed", e); null }
     }
 
     private fun downloadBitmap(url: String): Bitmap? = try {
