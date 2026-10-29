@@ -243,7 +243,10 @@ class AlbumArtService : NotificationListenerService() {
         if (prefs.getBoolean("original_saved", false)) return
         try {
             val wm  = WallpaperManager.getInstance(this)
-            val bmp = wm.getBitmap() ?: return
+            val pfd = wm.getWallpaperFile(WallpaperManager.FLAG_LOCK)
+                ?: wm.getWallpaperFile(WallpaperManager.FLAG_SYSTEM)
+                ?: return
+            val bmp = pfd.use { android.graphics.BitmapFactory.decodeFileDescriptor(it.fileDescriptor) } ?: return
             FileOutputStream(File(filesDir, "original.jpg")).use {
                 bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
             }
